@@ -86,7 +86,7 @@ def main():
     batch_size = 16             # 16, 8, 4
     pooling = 'Max'             # Max, Avg
     feature_layer = 4           # relu4-1 = 4, relu3-1 = 3, relu2-1 = 2
-    data_size = '160k'          # 160k, 40k, 5k, Art40k
+    data_size = '100k'          # 100k, 40k, 5k, Art40k
     alpha_beta = 10.0           # 10.0 (S = 10.0, C = 1.0),
                                 # 1.0 (S = 5.0, C = 5.0),
                                 # 0.1 (S = 1.0, C = 10.0)
@@ -111,7 +111,7 @@ def main():
     style_weight = 1.0
     content_weight = 1.0
 
-    if data_size == '160k':
+    if data_size == '100k':
         max_iter = 6250
         places_num = 274
     elif data_size == '40k':
@@ -205,6 +205,7 @@ def main():
         comment = f' epoch = {k}'
         writer = SummaryWriter(comment=comment)
 
+        network.train()
         for i in tqdm(range(max_iter)):
             adjust_learning_rate(optimizer, iteration_count=k)
             content_images = next(content_iter).to(device)
@@ -227,15 +228,16 @@ def main():
                     state_dict[key] = state_dict[key].to(torch.device('cpu'))
                 torch.save(state_dict, save_dir + '/' + 'decoder_iter_{:d}_epoch_{:d}.pth.tar'.format((i + 1), (k + 1)))
 
-        # for j in tqdm(range(max_iter_val)):
-        #     content_val_images = next(content_val_iter).to(device)
-        #     style_val_images = next(style_val_iter).to(device)
-        #     loss_c_val, loss_s_val = network(content_val_images, style_val_images)
-        #     loss_c_val = content_weight * loss_c_val
-        #     loss_s_val = style_weight * loss_s_val
-        #
-        #     writer.add_scalar('loss_content_val', loss_c_val.item(), j + 1)
-        #     writer.add_scalar('loss_style_val', loss_s_val.item(), j + 1)
+        network.eval()
+        for j in tqdm(range(max_iter_val)):
+            content_val_images = next(content_val_iter).to(device)
+            style_val_images = next(style_val_iter).to(device)
+            loss_c_val, loss_s_val = network(content_val_images, style_val_images)
+            loss_c_val = content_weight * loss_c_val
+            loss_s_val = style_weight * loss_s_val
+
+            writer.add_scalar('loss_content_val', loss_c_val.item(), j + 1)
+            writer.add_scalar('loss_style_val', loss_s_val.item(), j + 1)
 
         writer.close()
 
