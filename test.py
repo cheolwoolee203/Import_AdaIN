@@ -1,143 +1,390 @@
-from pathlib import Path
-
 import torch
 import torch.nn as nn
-from PIL import Image
-from torchvision import transforms
-from torchvision.utils import save_image
+from torchvision import models, transforms, datasets
+from torch.utils.data import DataLoader
+import torch.optim as optim
+import torch.optim.lr_scheduler as scheduler
 
-import net
-from function import adaptive_instance_normalization, coral
+from torchinfo import summary
+import numpy as np
+import time
+import os
 
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import matplotlib.pyplot as plt
 
-def test_transform(size, crop):
-    transform_list = []
-    if size != 0:
-        transform_list.append(transforms.Resize(size))
-    if crop:
-        transform_list.append(transforms.CenterCrop(size))
-    transform_list.append(transforms.ToTensor())
-    transform = transforms.Compose(transform_list)
-    return transform
-
-
-def style_transfer(vgg, decoder, content, style, alpha=1.0,
-                   interpolation_weights=None):
-    assert (0.0 <= alpha <= 1.0)
-    content_f = vgg(content)
-    style_f = vgg(style)
-    if interpolation_weights:
-        _, C, H, W = content_f.size()
-        feat = torch.FloatTensor(1, C, H, W).zero_().to(device)
-        base_feat = adaptive_instance_normalization(content_f, style_f)
-        for i, w in enumerate(interpolation_weights):
-            feat = feat + w * base_feat[i:i + 1]
-        content_f = content_f[0:1]
-    else:
-        feat = adaptive_instance_normalization(content_f, style_f)
-    feat = feat * alpha + content_f * (1 - alpha)
-    return decoder(feat)
+''' ** file structure setting
+- project
+    - data
+        -places365
+            - train
+            - train_custom_100
+            - train_custom_365
+            - val
+            - val_custom_100
+            - val_custom_365
+    - main.py
+    - test.py
+'''
 
 
-content = ""  # './input/content/texturecontent0.jpg'
-content_dir = './input/content_test'
-style = ""  # './input/style/00000161.jpg'
-style_dir = './input/style_test'
-vgg_dir = './input/models/vgg_normalised.pth'
-decoder_dir = './input/models/decoder_iter_10000.pth.tar'
-content_size = 512
-style_size = 512
-crop = 'store_true'
-save_ext = '.jpg'
-output = './output'
-alpha = 1.0
-preserve_color ='store_true'
-style_interpolation_weights = ''
+def plot_grad_flow(named_parameters):
+    ave_grads = []
+    layers = []
+    for n, p in named_parameters:
+        if (p.requires_grad) and ("bias" not in n):
+            layers.append(n)
+            ave_grads.append(p.grad.abs().mean())
+    plt.plot(ave_grads, alpha=0.3, color="b")
+    plt.hlines(0, 0, len(ave_grads) + 1, linewidth=1, color="k")
+    plt.xticks(range(0, len(ave_grads), 1), layers, rotation="vertical")
+    # plt.xlim(xmin=0, xmax=len(ave_grads))
+    plt.xlabel("Layers")
+    plt.ylabel("average gradient")
+    plt.title("Gradient flow")
+    plt.grid(True)
 
-do_interpolation = False
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 1. Datasets preprocessing    ** option
+'''
+1. data augmentation
+ : default = # transforms.RandomResizedCrop(224),
+             # transforms.RandomHorizontalFlip(),
+You can add more data augmentation technique and when you use, uncomment lines
 
-# Either --content or --contentDir should be given.
-content_paths = []
-assert (content or content_dir)
-if content:
-    content_paths = [Path(content)]
+2. normalize value - fixed
+ : default = [0.485, 0.456, 0.406],  # ImageNet mean & variance
+             [0.229, 0.224, 0.225]
+It is used at ImageNet and usually used in many codes
+'''
+image_transforms = {
+    'train': transforms.Compose([
+        transforms.Resize(256),
+        # transforms.RandomResizedCrop(224),
+        # transforms.RandomHorizontalFlip(),
+        transforms.CenterCrop(size=224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],  # ImageNet mean & variance
+                             [0.229, 0.224, 0.225])
+    ]),
+    'valid': transforms.Compose([
+        transforms.Resize(size=256),
+        transforms.CenterCrop(size=224),
+        transforms.Lambda(lambda y: y.convert('RGB')),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225])
+    ])
+}
+
+inverse_transforms = transforms.Compose([  # for image visualization
+    transforms.Normalize(mean=[0., 0., 0.],
+                         std=[1 / 0.229, 1 / 0.224, 1 / 0.225]),
+    transforms.Normalize(mean=[-0.485, -0.456, -0.406],
+                         std=[1., 1., 1.]),
+])
+
+# 2. Datasets preparing    ** option
+'''
+1. dataset size
+ : default = class_num = 365
+             train_dir = 'data/Places365/train_custom_365'
+             valid_dir = 'data/Places365/val_custom_365'
+train data: 1.8 million (365 * 5000) -> 365000 (365 * 1000) -> 100000 (100 * 1000)
+valid data: 3.6만개(365 * 100) -> 1.8만개(365 * 30) -> 0.3만개(100 * 30)
+
+1.8M
+    class_num = 365
+    train_dir = 'data/Places365/train'
+    valid_dir = 'data/Places365/val'
+
+365k
+    class_num = 365
+    train_dir = 'data/Places365/train_custom_365'
+    valid_dir = 'data/Places365/val_custom_365'
+
+100k
+    class_num = 100
+    train_dir = 'data/Places365/train_custom_100'
+    valid_dir = 'data/Places365/val_custom_100'
+
+2. batch_size
+ : default = 32
+The larger dataset size, the larger batch size (min: 2 / max: 32)
+'''
+
+class_num = 365
+train_dir = 'data/Places365/train_custom_365_2000'
+valid_dir = 'data/Places365/val_custom_365_30'
+batch_size = 32
+
+data = {
+    'train': datasets.ImageFolder(root=train_dir, transform=image_transforms['train']),
+    'valid': datasets.ImageFolder(root=valid_dir, transform=image_transforms['valid']),
+}
+
+train_data = DataLoader(data['train'], batch_size=batch_size, shuffle=True)
+valid_data = DataLoader(data['valid'], batch_size=batch_size, shuffle=True)
+
+train_size = len(data['train'])
+valid_size = len(data['valid'])
+print(' train data size:', train_size, ' valid data size:', valid_size)
+
+# check you datasets
+# train_data_iter = iter(train_data)
+# inputs, labels = next(train_data_iter)  # inputs: [32, 3, 224, 224] / labels: [32]
+#
+# inputs_RGB = inverse_transforms(inputs)
+# img = inputs_RGB[0].squeeze()
+# label = labels[0]
+# idx_to_class = os.listdir(train_dir)
+#
+# print("label number: {}, label: {}".format(label, idx_to_class[label]))
+# plt.imshow(img.permute(1, 2, 0))
+# plt.show()
+
+
+# 3. Neural network & training setting      ** option
+'''
+1. freeze_level (trainable parameter at pre-trained network level setting)
+ : default = 1
+1 : only FC layer
+2 : FC + 5_1
+3 : FC + 5_1 + 4_1
+4 : FC + 5_1 + 4_1 + 3_1
+5 : FC + 5_1 + 4_1 + 3_1 + 2_1
+6 : all
+
+
+2. FC_option (FC layer parameter setting )
+ : default = 1
+1 : one fully connected layer as classifier
+2 : two fully connected layer with classifier
+3 : three fully connected layer with classifier
+'''
+
+FC_option = 1
+freeze_level = 2
+
+device = 'cuda'
+iter_num = int(train_size / batch_size)
+data_per_class_num = int(train_size / class_num)
+
+vgg19 = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1)
+
+for param in vgg19.parameters():
+    param.requires_grad = True
+
+# freeze_level setting
+if freeze_level == 1:
+    for param in vgg19.parameters():
+        param.requires_grad = False
+elif freeze_level == 2:
+    for i in range(28):
+        for param in vgg19.features[i].parameters():
+            param.requires_grad = False
+elif freeze_level == 3:
+    for i in range(19):
+        for param in vgg19.features[i].parameters():
+            param.requires_grad = False
+elif freeze_level == 4:
+    for i in range(10):
+        for param in vgg19.features[i].parameters():
+            param.requires_grad = False
+elif freeze_level == 5:
+    for i in range(5):
+        for param in vgg19.features[i].parameters():
+            param.requires_grad = False
+elif freeze_level == 6:
+    pass
 else:
-    content_dir_Path = Path(content_dir)
-    content_paths_folder = [f for f in content_dir_Path.glob('*')]
-    for folder_name in content_paths_folder:
-        folder_name_Path = Path(folder_name)
-        content_paths += [f for f in folder_name_Path.glob('*')]
+    assert True, "Freeze level is out of range!!"
 
-# Either --style or --styleDir should be given.
-style_paths = []
-assert (style or style_dir)
-if style:
-    style_paths = style.split(',')
-    if len(style_paths) == 1:
-        style_paths = [Path(style)]
-    else:
-        do_interpolation = True
-        assert (style_interpolation_weights != ''), \
-            'Please specify interpolation weights'
-        weights = [int(i) for i in style_interpolation_weights.split(',')]
-        interpolation_weights = [w / sum(weights) for w in weights]
+# FC option setting
+if FC_option == 1:
+    vgg19.classifier = nn.Sequential(  # Linear layer 추가 또는 앞의 conv layer 4_1, 5_1 training
+        nn.Linear(25088, class_num),
+    )
+elif FC_option == 2:
+    vgg19.classifier = nn.Sequential(  # Linear layer 추가 또는 앞의 conv layer 4_1, 5_1 training
+        nn.Linear(25088, 1024, bias=True),
+        nn.ReLU(),
+        nn.Dropout(0.5),
+        nn.Linear(1024, class_num),
+    )
+elif FC_option == 3:
+    vgg19.classifier = nn.Sequential(  # Linear layer 추가 또는 앞의 conv layer 4_1, 5_1 training
+        nn.Linear(25088, 1024, bias=True),
+        nn.ReLU(),
+        nn.Dropout(0.5),
+        nn.Linear(1024, 1024, bias=True),
+        nn.ReLU(),
+        nn.Dropout(0.5),
+        nn.Linear(1024, class_num),
+    )
+elif FC_option == 4:
+    for param in vgg19.classifier.parameters():
+        param.requires_grad = False
+    vgg19.classifier[6] = nn.Linear(4096, class_num)
 else:
-    style_dir_Path = Path(style_dir)
-    style_paths_folder = [f for f in style_dir_Path.glob('*')]
-    for folder_name in style_paths_folder:
-        folder_name_Path = Path(folder_name)
-        style_paths += [f for f in folder_name_Path.glob('*')]
+    assert True, "FC_option is out of range!!"
 
-output_dir = Path(output)
-output_dir.mkdir(exist_ok=True, parents=True)
+vgg19_place365 = vgg19.to(device)
 
-decoder = net.decoder
-vgg = net.vgg
+# 4. Record setting
+ckpt_dir = './data/fc_option{}_trainable_option{}_ckpt_{}_{}_{}'.format(FC_option,
+                                                                        freeze_level, class_num, data_per_class_num,
+                                                                        batch_size)
+assert not os.path.isdir(ckpt_dir), 'remove the ckpt folder'
+os.mkdir(ckpt_dir)
+f = open(ckpt_dir + '/log.txt', 'w')
 
-decoder.eval()
-vgg.eval()
+writer1 = SummaryWriter(comment="train")
+writer2 = SummaryWriter(comment="valid")
 
-decoder.load_state_dict(torch.load(decoder_dir))
-vgg.load_state_dict(torch.load(vgg_dir))
-vgg = nn.Sequential(*list(vgg.children())[:31])
+# 5. Training setting   ** option
+'''
+1. epochs - fixed
+ : default = 100
+How many times to run training
 
-vgg.to(device)
-decoder.to(device)
+2. loss_func - fixed
+ : default = nn.CrossEntropyLoss()
+Use CrossEntropy loss whenever possible
 
-content_tf = test_transform(content_size, crop)
-style_tf = test_transform(style_size, crop)
+3. optimizer - fixed
+ : default = Adam
+Use Adam whenever possible
 
-for content_path in content_paths:
-    if do_interpolation:  # one content image, N style image
-        style = torch.stack([style_tf(Image.open(str(p))) for p in style_paths])
-        content = content_tf(Image.open(str(content_path))) \
-            .unsqueeze(0).expand_as(style)
-        style = style.to(device)
-        content = content.to(device)
-        with torch.no_grad():
-            output = style_transfer(vgg, decoder, content, style,
-                                    alpha, interpolation_weights)
-        output = output.cpu()
-        output_name = output_dir / '{:s}_interpolation{:s}'.format(
-            content_path.stem, save_ext)
-        save_image(output, str(output_name))
+4. initial_lr - fixed
+ : default = 1e-2
+initial learning rate. 
 
-    else:  # process one content and one style
-        for style_path in style_paths:
-            content = content_tf(Image.open(str(content_path)))
-            style = style_tf(Image.open(str(style_path)))
-            if preserve_color:
-                style = coral(style, content)
-            style = style.to(device).unsqueeze(0)
-            content = content.to(device).unsqueeze(0)
-            with torch.no_grad():
-                output = style_transfer(vgg, decoder, content, style,
-                                        alpha)
-            output = output.cpu()
+5. exp_lr_scheduler - fixed
+ : default = StepLR, step_size=10, gamma=0.1
+Experiment with different scheduler options and choose one. (MultiplicativeLR, StepLR, ExponentialLR, CosineAnnealingLR)
+'''
 
-            output_name = output_dir / '{:s}_stylized_{:s}{:s}'.format(
-                content_path.stem, style_path.stem, save_ext)
-            save_image(output, str(output_name))
+epochs = 100
+loss_func = nn.CrossEntropyLoss()
+initial_lr = 1e-4
+optimizer = optim.Adam(vgg19_place365.parameters(), lr=initial_lr)
+# exp_lr_scheduler = scheduler.LambdaLR(optimizer=optimizer, lr_lambda=lambda epoch: 0.95 ** epoch)
+# https://pytorch.org/docs/stable/optim.html
+exp_lr_scheduler = scheduler.StepLR(optimizer=optimizer, step_size=10, gamma=0.1)
 
+ckpt_interval = int(iter_num / 2)
+
+# 6. Training   ** option
+'''
+1. train_with_ckpt
+ : default = False
+if you train from checkpoint, change this to True
+
+2. epoch_start
+ : default = 0
+if you train from checkpoint, change this to epoch that you want to start
+
+3. ckpt_file_name
+ : default = "ckpt_epoch_x_batch_id_y.pth" 
+if you train from checkpoint, change this depending on your ckpt file name
+
+'''
+
+train_with_ckpt = False
+epoch_start = 0
+ckpt_file_name = "ckpt_epoch_x_batch_id_y.pth"
+
+if train_with_ckpt:
+    checkpoint = torch.load(os.path.join(ckpt_dir, ckpt_file_name))
+    vgg19_place365.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    epoch_start = checkpoint['epoch']
+
+for epoch in range(epoch_start, epochs):
+    f.write("Epoch: {}/{}\n".format(epoch + 1, epochs))
+    epoch_start = time.time()
+    vgg19_place365.train()
+    train_loss = 0.0
+    train_acc = 0.0
+    valid_loss = 0.0
+    valid_acc = 0.0
+    for i, (inputs, labels) in enumerate(tqdm(train_data)):
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+
+        # print(vgg19)
+        # for name, para in vgg19.named_parameters():
+        #    print(name, " : ", para.requires_grad)
+
+        optimizer.zero_grad()
+        outputs = vgg19_place365(inputs)
+        loss = loss_func(outputs, labels)
+        loss.requires_grad_(True)
+        loss.backward()
+        optimizer.step()
+        # print(vgg19_place365)
+
+        # train accuracy
+        ret, predictions = torch.max(outputs.data, 1)
+        correct_counts = predictions.eq(labels.data.view_as(predictions))
+        acc = torch.mean(correct_counts.type(torch.FloatTensor))
+
+        train_loss += loss.item() * inputs.size(0)
+        train_acc += acc.item() * inputs.size(0)
+
+        # record log
+        writer1.add_scalar("Batch/Train-loss", loss.item(), (i + 1) + int(train_size / batch_size) * epoch)
+        writer1.add_scalar("Batch/Train-accuracy", acc.item(), (i + 1) + int(train_size / batch_size) * epoch)
+
+        if ckpt_dir is not None and (i + 1) % ckpt_interval == 0:
+            ckpt_filename = 'ckpt_epoch_' + str(epoch + 1) + '_batch_id_' + str(i + 1) + '.pth'
+            f.write(str(epoch + 1) + ' checkpoint, ' + str(i + 1) + ' th batch is saved!\n')
+            ckpt_model_path = os.path.join(ckpt_dir, ckpt_filename)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': vgg19_place365.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': loss
+            }, ckpt_model_path)
+    print("Epoch: {}/{}".format(epoch + 1, epochs))
+
+    # scheduler check
+    exp_lr_scheduler.step()
+    f.write("learning rate: " + str(optimizer.param_groups[0]['lr']) + "\n")
+
+    # validation (check over-fitting & under-fitting looking at the tensorboard's loss & accuracy curve)
+    with torch.no_grad():
+        vgg19_place365.eval()
+        for j, (inputs, labels) in enumerate(tqdm(valid_data)):
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            outputs = vgg19_place365(inputs)
+            loss = loss_func(outputs, labels)
+
+            ret, predictions = torch.max(outputs.data, 1)
+            correct_counts = predictions.eq(labels.data.view_as(predictions))
+            acc = torch.mean(correct_counts.type(torch.FloatTensor))
+
+            valid_loss += loss.item() * inputs.size(0)
+            valid_acc += acc.item() * inputs.size(0)
+
+        avg_train_loss = train_loss / train_size
+        avg_train_acc = train_acc / float(train_size)
+        avg_valid_loss = valid_loss / valid_size
+        avg_valid_acc = valid_acc / float(valid_size)
+        epoch_end = time.time()
+
+        f.write("Epoch {} end - time: {}\n".format(epoch, epoch_end - epoch_start))
+        f.write("Training Average - Loss: {}, Accuracy: {}\n".format(avg_train_loss, avg_train_acc * 100))
+        f.write("Validation Average - Loss: {}, Accuracy: {}\n\n\n".format(avg_valid_loss, avg_valid_acc * 100))
+
+        writer1.add_scalar("Epoch/avg_loss", avg_train_loss, epoch + 1)
+        writer2.add_scalar("Epoch/avg_loss", avg_valid_loss, epoch + 1)
+        writer1.add_scalar("Epoch/avg_accuracy", avg_train_acc, epoch + 1)
+        writer2.add_scalar("Epoch/avg_accuracy", avg_valid_acc, epoch + 1)
+
+writer1.close()
+writer2.close()
+f.close()
